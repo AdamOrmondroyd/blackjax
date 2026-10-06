@@ -333,17 +333,46 @@ def build_chain(
 
     def kernel(rng_key, particle, logdensity_fn, proposal_generator, num_inner_steps):
         keys = random.split(rng_key, num_inner_steps)
+
+        def initialize(index, key, state, width):
+            return init_fn(key, state, width, max_expansions)
+
+        chain = build_scheduled_chain(initialize, interval, width, max_shrinkage)
+
+        def proposal(index, position, logdensity_fn):
+            proposal_key, _ = random.split(keys[index])
+            return proposal_generator(proposal_key, position, logdensity_fn)
+
+        return chain(keys, particle, logdensity_fn, proposal)
+
+    return kernel
+
+
+def build_scheduled_chain(
+    init_fn,
+    interval,
+    width=1.0,
+    max_shrinkage=None,
+):
+    """Build a chain with explicit move keys and indexed initialization.
+
+    The proposal generator receives the move index, position and log density
+    function; init_fn receives the index, key, slice state and width.
+    The returned kernel takes keys, particle, log density function
+    and proposal generator; the leading key dimension determines chain length.
+    """
+
+    def kernel(keys, particle, logdensity_fn, proposal_generator):
+        num_inner_steps = keys.shape[0]
         _, slice_key = random.split(keys[0])
         _, _, rng_key = random.split(slice_key, 3)
-        state = init_fn(
-            slice_key, SliceState(particle, particle.logdensity), width, max_expansions
-        )
+        state = init_fn(0, slice_key, SliceState(particle, particle.logdensity), width)
         info = SliceTransitionInfo(False, 0, 0, state.left, state.right)
         info = tree.map(lambda x: jnp.full(num_inner_steps, x), info)
 
         def body(carry):
             rng_key, origin, state, count, info = carry
-            proposal_key, slice_key = random.split(keys[count])
+            _, slice_key = random.split(keys[count])
             _, interval_key, _ = random.split(slice_key, 3)
             rng_key, step_key = lax.cond(
                 state.phase == _SHRINK,
@@ -351,7 +380,7 @@ def build_chain(
                 lambda key: jnp.stack((key, interval_key)),
                 rng_key,
             )
-            proposal = proposal_generator(proposal_key, origin.position, logdensity_fn)
+            proposal = proposal_generator(count, origin.position, logdensity_fn)
 
             def slice_fn(t):
                 candidate, valid = proposal(t)
@@ -402,10 +431,10 @@ def build_chain(
                 _, slice_key = random.split(keys[count])
                 _, _, shrink_key = random.split(slice_key, 3)
                 next_state = init_fn(
+                    count,
                     slice_key,
                     SliceState(particle, particle.logdensity),
                     width,
-                    max_expansions,
                 )
                 return shrink_key, particle, next_state
 

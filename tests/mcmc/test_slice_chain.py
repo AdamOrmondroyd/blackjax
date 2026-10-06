@@ -9,6 +9,84 @@ from blackjax.mcmc import slice_fsm
 from blackjax.mcmc.slice import direction_proposal, init
 
 
+@pytest.mark.parametrize("doubling", [False, True])
+def test_scheduled_chain_matches_chain(doubling):
+    initialize = slice_fsm.init_doubling if doubling else slice_fsm.init_stepping_out
+    interval = (
+        slice_fsm.build_doubling_kernel
+        if doubling
+        else slice_fsm.build_stepping_out_kernel
+    )
+
+    def logdensity(position):
+        return -jnp.sum(position**2) / 2
+
+    key = jax.random.key(34)
+    keys = jax.random.split(key, 4)
+    state = init(jnp.array([0.3, -0.7]), logdensity)
+    generate = direction_proposal()
+    chain = slice_fsm.build_chain(init_fn=initialize, interval=interval)
+    scheduled = slice_fsm.build_scheduled_chain(
+        lambda _, k, p, w: initialize(k, p, w, 10), interval
+    )
+
+    def proposal(index, position, logdensity_fn):
+        proposal_key, _ = jax.random.split(keys[index])
+        return generate(proposal_key, position, logdensity_fn)
+
+    expected = jax.jit(lambda k, p: chain(k, p, logdensity, generate, 4))(key, state)
+    actual = jax.jit(lambda k, p: scheduled(k, p, logdensity, proposal))(keys, state)
+    for x, y in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+        assert np.asarray(x).tobytes() == np.asarray(y).tobytes()
+
+
+def test_scheduled_chain():
+    def logdensity(position):
+        return -jnp.sum(position**2) / 2
+
+    caps = jnp.array([1, 4, 8, 2])
+    directions = jnp.array([[1.0, 0.0], [0.0, 2.0], [1.0, 1.0], [-1.0, 0.0]])
+
+    def initialize(index, key, state, width):
+        return slice_fsm.init_stepping_out(key, state, width, caps[index])
+
+    def proposal(index, position, logdensity_fn):
+        return lambda t: (init(position + directions[index] * t, logdensity_fn), True)
+
+    chain = slice_fsm.build_scheduled_chain(
+        initialize, slice_fsm.build_stepping_out_kernel, max_shrinkage=100
+    )
+    keys = jax.random.split(jax.random.key(15), (16, 4))
+    states = jax.vmap(partial(init, logdensity_fn=logdensity))(
+        jax.random.normal(jax.random.key(16), (16, 2))
+    )
+    run = jax.jit(jax.vmap(lambda k, p: chain(k, p, logdensity, proposal)))
+    actual = run(keys, states)
+    expected, infos = states, []
+    for index in range(4):
+        one = slice_fsm.build_scheduled_chain(
+            lambda _, k, p, w: initialize(index, k, p, w),
+            slice_fsm.build_stepping_out_kernel,
+            max_shrinkage=100,
+        )
+        step = jax.jit(
+            jax.vmap(
+                lambda k, p: one(
+                    k, p, logdensity, lambda _, x, fn: proposal(index, x, fn)
+                )
+            )
+        )
+        expected, info = step(keys[:, index : index + 1], expected)
+        infos.append(info)
+    info = jax.tree.map(lambda *xs: jnp.concatenate(xs, axis=1), *infos)
+    for x, y in zip(
+        jax.tree.leaves(actual), jax.tree.leaves((expected, info)), strict=True
+    ):
+        np.testing.assert_allclose(x, y, rtol=1e-12, atol=1e-12)
+    assert jnp.all(actual[1].is_accepted)
+    assert jnp.all(actual[1].bracket_right - actual[1].bracket_left <= caps)
+
+
 @pytest.mark.parametrize("chain", [False, True])
 @pytest.mark.parametrize("doubling", [False, True])
 def test_wrapped_components(chain, doubling):
