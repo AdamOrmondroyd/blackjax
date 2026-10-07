@@ -12,14 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """MCMC diagnostics."""
-from typing import NamedTuple
+
+from collections.abc import Callable
+from typing import NamedTuple, TypeAlias
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from scipy.fftpack import next_fast_len  # type: ignore
+from jax.flatten_util import ravel_pytree
+from scipy.fftpack import next_fast_len
 
-from blackjax.types import Array, ArrayLike
+from blackjax.types import Array, ArrayLike, ArrayLikeTree
+
+#: A real multi-dimensional array -- unlike ArrayLike, excludes the bare
+#: Python/numpy scalar branches, since every diagnostic in this module calls
+#: .shape/.mean/.var directly on its input (tests pass both jax Arrays and
+#: plain numpy arrays, never a bare scalar).
+ChainArray: TypeAlias = Array | np.ndarray
 
 __all__ = [
     "potential_scale_reduction",
@@ -33,11 +42,13 @@ __all__ = [
     "divergence_concentration",
     "divergence_concentration_from_counts",
     "format_divergence_warning",
+    "imq_kernel",
+    "kernelized_stein_discrepancy",
 ]
 
 
 def potential_scale_reduction(
-    input_array: ArrayLike, chain_axis: int = 0, sample_axis: int = 1
+    input_array: ChainArray, chain_axis: int = 0, sample_axis: int = 1
 ) -> Array:
     """Gelman and Rubin (1992)'s potential scale reduction for computing multiple MCMC chain convergence.
 
@@ -67,9 +78,9 @@ def potential_scale_reduction(
     greater than one indicate that one or more chains have not yet converged :cite:p:`stan_rhat,gelman1992inference`.
 
     """
-    assert (
-        input_array.shape[chain_axis] > 1
-    ), "potential_scale_reduction as implemented only works for two or more chains."
+    assert input_array.shape[chain_axis] > 1, (
+        "potential_scale_reduction as implemented only works for two or more chains."
+    )
 
     num_samples = input_array.shape[sample_axis]
     # Compute stats for each chain
@@ -89,7 +100,7 @@ def potential_scale_reduction(
     return rhat_value.squeeze()
 
 
-def rhat(input_array: ArrayLike, chain_axis: int = 0, sample_axis: int = 1) -> Array:
+def rhat(input_array: ChainArray, chain_axis: int = 0, sample_axis: int = 1) -> Array:
     """Rank-normalized split-R̂ (Vehtari et al. 2021).
 
     The modern improved R̂ diagnostic.  Combines two split-chain R̂ values —
@@ -167,7 +178,7 @@ def rhat(input_array: ArrayLike, chain_axis: int = 0, sample_axis: int = 1) -> A
 
 
 def effective_sample_size(
-    input_array: ArrayLike, chain_axis: int = 0, sample_axis: int = 1
+    input_array: ChainArray, chain_axis: int = 0, sample_axis: int = 1
 ) -> Array:
     """Compute estimate of the effective sample size (ess).
 
@@ -211,9 +222,9 @@ def effective_sample_size(
     sample_axis = sample_axis if sample_axis >= 0 else len(input_shape) + sample_axis
     num_chains = input_shape[chain_axis]
     num_samples = input_shape[sample_axis]
-    assert (
-        num_samples > 1
-    ), f"The input array must have at least 2 samples, got only {num_samples}."
+    assert num_samples > 1, (
+        f"The input array must have at least 2 samples, got only {num_samples}."
+    )
 
     first_sample = jnp.take(input_array, jnp.array([0]), axis=sample_axis)
     has_within_chain_variation = jnp.any(
@@ -244,8 +255,9 @@ def effective_sample_size(
     weighted_var = mean_var0 * (num_samples - 1.0) / num_samples
     weighted_var = jax.lax.cond(
         num_chains > 1,
-        lambda mean_across_chain: weighted_var
-        + mean_across_chain.var(axis=chain_axis, ddof=1, keepdims=True),
+        lambda mean_across_chain: (
+            weighted_var + mean_across_chain.var(axis=chain_axis, ddof=1, keepdims=True)
+        ),
         lambda _: weighted_var,
         operand=mean_across_chain,
     )
@@ -284,10 +296,12 @@ def effective_sample_size(
         positive_sequence_body_fn, (0, carry_cond, max_t), mask0
     )
     indices = jnp.indices(max_t_next.shape)
-    indices = tuple([max_t_next + 1] + [indices[i] for i in range(max_t_next.ndim)])
+    # Renamed from `indices` (the tuple result shadowed the Array above
+    # under a different, incompatible type).
+    index_tuple = tuple([max_t_next + 1] + [indices[i] for i in range(max_t_next.ndim)])
     rho_hat_odd = jnp.where(mask, rho_hat_odd, jnp.zeros_like(rho_hat_odd))
     # improve estimation
-    mask_even = mask.at[indices].set(rho_hat_even[indices] > 0)
+    mask_even = mask.at[index_tuple].set(rho_hat_even[index_tuple] > 0)
     rho_hat_even = jnp.where(mask_even, rho_hat_even, jnp.zeros_like(rho_hat_even))
 
     # Geyer's initial monotone sequence
@@ -309,7 +323,7 @@ def effective_sample_size(
     tau_hat = (
         -1.0
         + 2.0 * jnp.sum(rho_hat_even_final + rho_hat_odd_final, axis=0)
-        - rho_hat_even_final[indices]
+        - rho_hat_even_final[index_tuple]
     )
 
     tau_hat = jnp.maximum(tau_hat, 1 / np.log10(ess_raw))
@@ -550,7 +564,7 @@ def _rank_normalize(x: Array) -> Array:
 
 
 def ess_bulk(
-    input_array: ArrayLike, chain_axis: int = 0, sample_axis: int = 1
+    input_array: ChainArray, chain_axis: int = 0, sample_axis: int = 1
 ) -> Array:
     """Bulk effective sample size (rank-normalized split-chain ESS).
 
@@ -594,7 +608,7 @@ def ess_bulk(
 
 
 def ess_tail(
-    input_array: ArrayLike,
+    input_array: ChainArray,
     chain_axis: int = 0,
     sample_axis: int = 1,
     prob: float = 0.90,
@@ -1121,8 +1135,8 @@ def format_divergence_warning(report: DivergenceConcentrationReport) -> str:
 
     lines = []
     flagged = np.asarray(report.flagged)
-    for k in np.flatnonzero(flagged):
-        k = int(k)
+    for k_np in np.flatnonzero(flagged):
+        k = int(k_np)
         pct = "%.1f" % (float(report.rates[k]) * 100.0)
         median = "%.1f" % (float(report.median_other_rate[k]) * 100.0)
         early = float(report.early_rate[k])
@@ -1130,10 +1144,7 @@ def format_divergence_warning(report: DivergenceConcentrationReport) -> str:
         if np.isfinite(early) and np.isfinite(late):
             early_str = "%.1f" % (early * 100.0)
             late_str = "%.1f" % (late * 100.0)
-            quarters = " ({}% in the first quarter, {}% in the last)".format(
-                early_str,
-                late_str,
-            )
+            quarters = f" ({early_str}% in the first quarter, {late_str}% in the last)"
         else:
             quarters = ""
         lines.append(
@@ -1143,3 +1154,98 @@ def format_divergence_warning(report: DivergenceConcentrationReport) -> str:
             "untrustworthy."
         )
     return "\n".join(lines)
+
+
+def imq_kernel(x: Array, y: Array, c: float = 1.0, beta: float = -0.5) -> Array:
+    """Inverse multiquadric kernel ``(c² + ||x-y||²)**beta``.
+
+    Use ``c > 0`` and ``-1 < beta < 0``. Bind non-default parameters with
+    ``functools.partial``. Convergence guarantees additionally require target
+    conditions; see :cite:p:`gorham2017kernels`.
+    """
+    return (c**2 + jnp.sum((x - y) ** 2)) ** beta
+
+
+def kernelized_stein_discrepancy(
+    samples: ArrayLikeTree,
+    grad_logdensity_fn: Callable,
+    kernel: Callable,
+    *,
+    statistic: str = "v",
+) -> Array:
+    """Estimate squared kernelized Stein discrepancy with a V- or U-statistic.
+
+    Parameters
+    ----------
+    samples
+        PyTree (an array, or a dict/tuple/NamedTuple of per-field arrays) whose
+        leaves share a leading ``num_samples`` axis. Chain dimensions must be
+        pooled explicitly before calling this function.
+    grad_logdensity_fn
+        Target score function, mapping one sample (one leading-axis slice of
+        ``samples``, with the same PyTree structure) to the gradient of its log
+        density. For example, ``jax.grad(logdensity_fn)``. The normalizing
+        constant is not required.
+    kernel
+        Scalar-valued, twice differentiable positive semidefinite kernel taking
+        two flattened sample vectors. Bind kernel parameters such as bandwidth
+        with ``functools.partial``. The kernel must satisfy the target's Stein
+        boundary conditions; choosing an appropriate kernel is the caller's
+        responsibility.
+
+    statistic
+        ``"v"`` includes diagonal pairs; ``"u"`` excludes them and requires at
+        least two draws. The U-statistic can be negative, even in exact arithmetic.
+
+    Returns
+    -------
+    Estimate of squared KSD, not a calibrated p-value or convergence certificate.
+    The V-statistic has a sample-dependent diagonal bias of order ``1/n``.
+
+    Notes
+    -----
+    Complements rather than replaces R-hat. Approximately independent draws are
+    assumed; autocorrelation and an unvisited mode can make the result misleading.
+    A positive semidefinite kernel alone does not identify every distribution:
+    this requires additional conditions, including integral strict positive
+    definiteness :cite:p:`liu2016kernelized`. Gaussian RBF kernels do not in
+    general detect non-convergence in dimension three or higher. IMQ kernels
+    have convergence guarantees for suitable targets, but targets with bounded
+    scores, including some heavy-tailed targets, remain a gap
+    :cite:p:`gorham2017kernels`.
+
+    Uses the score/kernel derivative expression in :cite:p:`liu2016kernelized`.
+    Rows are processed sequentially and columns are vectorized. The computation
+    has quadratic cost in sample count and mixed Hessians with ``d²`` entries;
+    temporary pairwise storage scales as ``O(n*d²)`` rather than ``O(n²*d²)``.
+    The supplied functions must support JAX differentiation and transformations.
+    No clipping is applied to either statistic.
+    """
+    if statistic not in ("v", "u"):
+        raise ValueError("statistic must be v or u")
+    flat = jax.vmap(lambda s: ravel_pytree(s)[0])(samples)
+    scores = jax.vmap(lambda s: ravel_pytree(grad_logdensity_fn(s))[0])(samples)
+    kernel_value_and_grad = jax.value_and_grad(kernel, argnums=(0, 1))
+    mixed_derivative = jax.jacfwd(jax.grad(kernel, argnums=0), argnums=1)
+
+    def stein_kernel(x, y, score_x, score_y):
+        value, (grad_x, grad_y) = kernel_value_and_grad(x, y)
+        return (
+            value * jnp.dot(score_x, score_y)
+            + jnp.dot(score_x, grad_y)
+            + jnp.dot(grad_x, score_y)
+            + jnp.trace(mixed_derivative(x, y))
+        )
+
+    def row_sum(args):
+        x, score_x = args
+        return jax.vmap(stein_kernel, in_axes=(None, 0, None, 0))(
+            x, flat, score_x, scores
+        ).sum()
+
+    n = flat.shape[0]
+    total = jax.lax.map(row_sum, (flat, scores)).sum()
+    if statistic == "v":
+        return total / n**2
+    diagonal = jax.vmap(stein_kernel)(flat, flat, scores, scores).sum()
+    return (total - diagonal) / (n * (n - 1))
